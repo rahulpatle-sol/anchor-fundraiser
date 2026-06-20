@@ -1,21 +1,10 @@
-use anchor_lang::error_code;
-
-#[error_code]
-pub enum FundraiserError {
-    #[msg("The amount to raise has not been met")]
-    TargetNotMet,
-    #[msg("The amount to raise has been achieved")]
-    TargetMet,
-    #[msg("The contribution is too big")]
-    ContributionTooBig,
-    #[msg("The contribution is too small")]
-    ContributionTooSmall,
-    #[msg("The maximum amount to contribute has been reached")]
-    MaximumContributionsReached,
-    #[msg("The fundraiser has not ended yet")]
-    FundraiserNotEnded,
-    #[msg("The fundraiser has ended")]
-    FundraiserEnded,
-    #[msg("Invalid total amount. i should be bigger than 3")]
-    InvalidAmount
-}
+pub const ERR_TARGET_NOT_MET: u32 = 0;
+pub const ERR_TARGET_MET: u32 = 1;
+pub const ERR_CONTRIBUTION_TOO_BIG: u32 = 2;
+pub const ERR_CONTRIBUTION_TOO_SMALL: u32 = 3;
+pub const ERR_MAXIMUM_CONTRIBUTIONS_REACHED: u32 = 4;
+pub const ERR_FUNDRAISER_NOT_ENDED: u32 = 5;
+pub const ERR_FUNDRAISER_ENDED: u32 = 6;
+pub const ERR_INVALID_AMOUNT: u32 = 7;
+pub const ERR_INVALID_ACCOUNT_OWNER: u32 = 8;
+pub const ERR_ARITHMETIC_OVERFLOW: u32 = 9;

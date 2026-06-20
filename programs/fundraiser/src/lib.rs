@@ -1,45 +1,40 @@
-use anchor_lang::prelude::*;
+use pinocchio::{
+    AccountView,
+    Address,
+    entrypoint,
+    error::ProgramError,
+    ProgramResult,
+};
 
-declare_id!("Eoiuq1dXvHxh6dLx3wh9gj8kSAUpga11krTrbfF5XYsC");
+pub const ID: Address = Address::new_from_array([
+    0x12, 0x8c, 0xfa, 0x23, 0x1a, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78,
+]);
 
 mod state;
-mod instructions;
 mod error;
-mod constants;
+mod instructions;
 
 use instructions::*;
-use error::*;
-pub use constants::*;
 
-#[program]
-pub mod fundraiser {
-    use super::*;
+entrypoint!(process_instruction);
 
-    pub fn initialize(ctx: Context<Initialize>, amount: u64, duration: u8) -> Result<()> {
+fn process_instruction(
+    _program_id: &Address,
+    accounts: &mut [AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let (discriminator, data) = instruction_data
+        .split_first()
+        .ok_or(ProgramError::InvalidInstructionData)?;
 
-        ctx.accounts.initialize(amount, duration, &ctx.bumps)?;
-
-        Ok(())
-    }
-
-    pub fn contribute(ctx: Context<Contribute>, amount: u64) -> Result<()> {
-
-        ctx.accounts.contribute(amount)?;
-
-        Ok(())
-    }
-
-    pub fn check_contributions(ctx: Context<CheckContributions>) -> Result<()> {
-
-        ctx.accounts.check_contributions()?;
-
-        Ok(())
-    }
-
-    pub fn refund(ctx: Context<Refund>) -> Result<()> {
-
-        ctx.accounts.refund()?;
-
-        Ok(())
+    match *discriminator {
+        0 => initialize(data, accounts),
+        1 => contribute(data, accounts),
+        2 => check_contributions(data, accounts),
+        3 => refund(data, accounts),
+        _ => Err(ProgramError::InvalidInstructionData),
     }
 }

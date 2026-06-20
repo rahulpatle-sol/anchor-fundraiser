@@ -1,7 +1,7 @@
 [package]
 name = "fundraiser"
 version = "0.1.0"
-description = "Created with Anchor"
+description = "Fundraiser program (Pinocchio)"
 edition = "2021"
 
 [lib]
@@ -9,13 +9,12 @@ crate-type = ["cdylib", "lib"]
 name = "fundraiser"
 
 [features]
-default = []
-cpi = ["no-entrypoint"]
-no-entrypoint = []
-no-idl = []
-no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+default = ["perf"]
+perf = []
+bpf-entrypoint = []
 
 [dependencies]
-anchor-lang = { version = "0.30.0", features = ["init-if-needed"] }
-anchor-spl = "0.30.0"
+pinocchio = { version = "0.11", features = ["cpi"] }
+pinocchio-token = "0.6"
+pinocchio-system = "0.6"
+pinocchio-associated-token-account = "0.4"

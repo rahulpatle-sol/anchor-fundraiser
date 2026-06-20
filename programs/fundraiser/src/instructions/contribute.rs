@@ -1,109 +1,193 @@
-use anchor_lang::prelude::*;
-use anchor_spl::token::{
-    Mint, 
-    transfer, 
-    Token, 
-    TokenAccount, 
-    Transfer
+use pinocchio::{
+    AccountView,
+    Address,
+    error::ProgramError,
+    sysvars::{clock::Clock, rent::Rent, Sysvar},
+    ProgramResult,
 };
+use pinocchio_system::instructions::CreateAccount;
+use pinocchio_token::{instructions::Transfer, state::Mint};
 
 use crate::{
     state::{
-        Contributor, 
-        Fundraiser
-    }, FundraiserError, 
-    ANCHOR_DISCRIMINATOR, 
-    MAX_CONTRIBUTION_PERCENTAGE, 
-    PERCENTAGE_SCALER, SECONDS_TO_DAYS
+        Fundraiser, Contributor,
+        SEED_FUNDRAISER, DISCRIMINATOR_CONTRIBUTOR,
+    },
+    error::{
+        ERR_CONTRIBUTION_TOO_SMALL, ERR_CONTRIBUTION_TOO_BIG,
+        ERR_MAXIMUM_CONTRIBUTIONS_REACHED, ERR_FUNDRAISER_ENDED,
+        ERR_ARITHMETIC_OVERFLOW,
+    },
 };
+use crate::ID;
 
-#[derive(Accounts)]
-pub struct Contribute<'info> {
-    #[account(mut)]
-    pub contributor: Signer<'info>,
-    pub mint_to_raise: Account<'info, Mint>,
-    #[account(
-        mut,
-        has_one = mint_to_raise,
-        seeds = [b"fundraiser".as_ref(), fundraiser.maker.as_ref()],
-        bump = fundraiser.bump,
-    )]
-    pub fundraiser: Account<'info, Fundraiser>,
-    #[account(
-        init_if_needed,
-        payer = contributor,
-        seeds = [b"contributor", fundraiser.key().as_ref(), contributor.key().as_ref()],
-        bump,
-        space = ANCHOR_DISCRIMINATOR + Contributor::INIT_SPACE,
-    )]
-    pub contributor_account: Account<'info, Contributor>,
-    #[account(
-        mut,
-        associated_token::mint = mint_to_raise,
-        associated_token::authority = contributor
-    )]
-    pub contributor_ata: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        associated_token::mint = fundraiser.mint_to_raise,
-        associated_token::authority = fundraiser
-    )]
-    pub vault: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-}
+const SECONDS_TO_DAYS: i64 = 86400;
+const MAX_CONTRIBUTION_PERCENTAGE: u64 = 10;
+const PERCENTAGE_SCALER: u64 = 100;
 
-impl<'info> Contribute<'info> {
-    pub fn contribute(&mut self, amount: u64) -> Result<()> {
+pub fn contribute(data: &[u8], accounts: &mut [AccountView]) -> ProgramResult {
+    let [contributor, mint_to_raise, fundraiser, contributor_account, contributor_ata, vault, token_program, system_program, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-        // Check if the amount to contribute meets the minimum amount required
-        require!(
-            amount > 1_u8.pow(self.mint_to_raise.decimals as u32) as u64, 
-            FundraiserError::ContributionTooSmall
-        );
-
-        // Check if the amount to contribute is less than the maximum allowed contribution
-        require!(
-            amount <= (self.fundraiser.amount_to_raise * MAX_CONTRIBUTION_PERCENTAGE) / PERCENTAGE_SCALER, 
-            FundraiserError::ContributionTooBig
-        );
-
-        // Check if the fundraising duration has been reached
-        let current_time = Clock::get()?.unix_timestamp;
-        require!(
-            self.fundraiser.duration <= ((current_time - self.fundraiser.time_started) / SECONDS_TO_DAYS) as u8,
-            crate::FundraiserError::FundraiserEnded
-        );
-
-        // Check if the maximum contributions per contributor have been reached
-        require!(
-            (self.contributor_account.amount <= (self.fundraiser.amount_to_raise * MAX_CONTRIBUTION_PERCENTAGE) / PERCENTAGE_SCALER)
-                && (self.contributor_account.amount + amount <= (self.fundraiser.amount_to_raise * MAX_CONTRIBUTION_PERCENTAGE) / PERCENTAGE_SCALER),
-            FundraiserError::MaximumContributionsReached
-        );
-
-        // Transfer the funds to the vault
-        // CPI to the token program to transfer the funds
-        let cpi_program = self.token_program.to_account_info();
-
-        // Transfer the funds from the contributor to the vault
-        let cpi_accounts = Transfer {
-            from: self.contributor_ata.to_account_info(),
-            to: self.vault.to_account_info(),
-            authority: self.contributor.to_account_info(),
-        };
-
-        // Crete a CPI context
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-
-        // Transfer the funds from the contributor to the vault
-        transfer(cpi_ctx, amount)?;
-
-        // Update the fundraiser and contributor accounts with the new amounts
-        self.fundraiser.current_amount += amount;
-
-        self.contributor_account.amount += amount;
-
-        Ok(())
+    if !contributor.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
     }
+
+    let amount = u64::from_le_bytes(
+        data.get(..8)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    );
+
+    let fund_data = fundraiser.try_borrow()?;
+    let fund = Fundraiser::from_bytes(&fund_data)?;
+
+    if fund.mint_to_raise != mint_to_raise.address().to_bytes() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let expected_fundraiser =
+        Address::find_program_address(&[SEED_FUNDRAISER, fund.maker.as_ref()], &ID).0;
+    if fundraiser.address() != &expected_fundraiser {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let mint = unsafe { Mint::from_account_view_unchecked(mint_to_raise)? };
+    let min_contribution = 1u64
+        .checked_pow(mint.decimals() as u32)
+        .ok_or(ProgramError::Custom(ERR_CONTRIBUTION_TOO_SMALL))?;
+
+    if amount <= min_contribution {
+        return Err(ProgramError::Custom(ERR_CONTRIBUTION_TOO_SMALL));
+    }
+
+    let max_allowed = fund
+        .amount_to_raise
+        .checked_mul(MAX_CONTRIBUTION_PERCENTAGE)
+        .ok_or(ProgramError::Custom(ERR_ARITHMETIC_OVERFLOW))?
+        .checked_div(PERCENTAGE_SCALER)
+        .ok_or(ProgramError::Custom(ERR_ARITHMETIC_OVERFLOW))?;
+
+    if amount > max_allowed {
+        return Err(ProgramError::Custom(ERR_CONTRIBUTION_TOO_BIG));
+    }
+
+    let current_time = Clock::get()?.unix_timestamp;
+    let elapsed_days = current_time
+        .checked_sub(fund.time_started)
+        .ok_or(ProgramError::Custom(ERR_FUNDRAISER_ENDED))?
+        .checked_div(SECONDS_TO_DAYS)
+        .ok_or(ProgramError::Custom(ERR_FUNDRAISER_ENDED))?;
+
+    if fund.duration <= elapsed_days as u8 {
+        return Err(ProgramError::Custom(ERR_FUNDRAISER_ENDED));
+    }
+    let fund_maker = fund.maker;
+    let fund_amount_to_raise = fund.amount_to_raise;
+    drop(fund_data);
+
+    let expected_contributor = Contributor::derive_pda(
+        fundraiser.address(),
+        contributor.address(),
+        &ID,
+    )
+    .0;
+
+    let has_existing_contributor = if contributor_account.data_len() == 0 {
+        false
+    } else {
+        let cont_data = contributor_account.try_borrow()?;
+        cont_data.len() >= Contributor::LEN && cont_data[0] == DISCRIMINATOR_CONTRIBUTOR
+    };
+
+    if !has_existing_contributor {
+        if contributor_account.address() != &expected_contributor {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        if !contributor_account.owned_by(&pinocchio_system::ID) {
+            return Err(ProgramError::InvalidAccountOwner);
+        }
+
+        let rent = Rent::get()?;
+        let lamports = rent.minimum_balance(Contributor::LEN as u64);
+
+        CreateAccount {
+            from: contributor,
+            to: contributor_account,
+            lamports,
+            space: Contributor::LEN as u64,
+            owner: &ID,
+        }
+        .invoke()?;
+
+        let mut cont_data = contributor_account.try_borrow_mut()?;
+        Contributor::init(&mut cont_data, &Contributor { amount: 0 });
+    } else {
+        if contributor_account.address() != &expected_contributor {
+            return Err(ProgramError::InvalidSeeds);
+        }
+    }
+
+    let cont_data = contributor_account.try_borrow()?;
+    let cont = Contributor::from_bytes(&cont_data)?;
+
+    if cont.amount > max_allowed {
+        return Err(ProgramError::Custom(ERR_MAXIMUM_CONTRIBUTIONS_REACHED));
+    }
+    let new_total = cont
+        .amount
+        .checked_add(amount)
+        .ok_or(ProgramError::Custom(ERR_ARITHMETIC_OVERFLOW))?;
+    if new_total > max_allowed {
+        return Err(ProgramError::Custom(ERR_MAXIMUM_CONTRIBUTIONS_REACHED));
+    }
+    let cont_current = cont.amount;
+    drop(cont_data);
+
+    let contributor_ata_expected = Address::find_program_address(
+        &[
+            contributor.address().as_ref(),
+            token_program.address().as_ref(),
+            mint_to_raise.address().as_ref(),
+        ],
+        &pinocchio_associated_token_account::ID,
+    )
+    .0;
+    if contributor_ata.address() != &contributor_ata_expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let vault_expected = Address::find_program_address(
+        &[
+            fundraiser.address().as_ref(),
+            token_program.address().as_ref(),
+            mint_to_raise.address().as_ref(),
+        ],
+        &pinocchio_associated_token_account::ID,
+    )
+    .0;
+    if vault.address() != &vault_expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    Transfer::new(contributor_ata, vault, contributor, amount).invoke()?;
+
+    let mut fund_data = fundraiser.try_borrow_mut()?;
+    let fund = Fundraiser::from_bytes_mut(&mut fund_data)?;
+    fund.current_amount = fund
+        .current_amount
+        .checked_add(amount)
+        .ok_or(ProgramError::Custom(ERR_ARITHMETIC_OVERFLOW))?;
+    drop(fund_data);
+
+    let mut cont_data = contributor_account.try_borrow_mut()?;
+    let cont = Contributor::from_bytes_mut(&mut cont_data)?;
+    cont.amount = cont_current
+        .checked_add(amount)
+        .ok_or(ProgramError::Custom(ERR_ARITHMETIC_OVERFLOW))?;
+
+    Ok(())
 }

@@ -1,99 +1,152 @@
-use anchor_lang::prelude::*;
-use anchor_spl::token::{
-    transfer, 
-    Mint, 
-    Token, 
-    TokenAccount, 
-    Transfer
+use pinocchio::{
+    AccountView,
+    Address,
+    cpi::{Seed, Signer},
+    error::ProgramError,
+    sysvars::clock::Clock,
+    ProgramResult,
+};
+use pinocchio_token::{
+    instructions::Transfer,
+    state::Account as TokenAccount,
 };
 
 use crate::{
     state::{
-        Contributor, 
-        Fundraiser
-    }, 
-    SECONDS_TO_DAYS
+        Fundraiser, Contributor,
+        SEED_FUNDRAISER, DISCRIMINATOR_CONTRIBUTOR,
+    },
+    error::{
+        ERR_TARGET_MET, ERR_FUNDRAISER_NOT_ENDED,
+        ERR_ARITHMETIC_OVERFLOW,
+    },
 };
+use crate::ID;
 
-#[derive(Accounts)]
-pub struct Refund<'info> {
-    #[account(mut)]
-    pub contributor: Signer<'info>,
-    pub maker: SystemAccount<'info>,
-    pub mint_to_raise: Account<'info, Mint>,
-    #[account(
-        mut,
-        has_one = mint_to_raise,
-        seeds = [b"fundraiser", maker.key().as_ref()],
-        bump = fundraiser.bump,
-    )]
-    pub fundraiser: Account<'info, Fundraiser>,
-    #[account(
-        mut,
-        seeds = [b"contributor", fundraiser.key().as_ref(), contributor.key().as_ref()],
-        bump,
-        close = contributor,
-    )]
-    pub contributor_account: Account<'info, Contributor>,
-    #[account(
-        mut,
-        associated_token::mint = mint_to_raise,
-        associated_token::authority = contributor
-    )]
-    pub contributor_ata: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        associated_token::mint = mint_to_raise,
-        associated_token::authority = fundraiser
-    )]
-    pub vault: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-}
+const SECONDS_TO_DAYS: i64 = 86400;
 
-impl<'info> Refund<'info> {
-    pub fn refund(&mut self) -> Result<()> {
+pub fn refund(_data: &[u8], accounts: &mut [AccountView]) -> ProgramResult {
+    let [contributor, maker, mint_to_raise, fundraiser, contributor_account, contributor_ata, vault, token_program, system_program, ..] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-        // Check if the fundraising duration has been reached
-        let current_time = Clock::get()?.unix_timestamp;
- 
-        require!(
-            self.fundraiser.duration >= ((current_time - self.fundraiser.time_started) / SECONDS_TO_DAYS) as u8,
-            crate::FundraiserError::FundraiserNotEnded
-        );
-
-        require!(
-            self.vault.amount < self.fundraiser.amount_to_raise,
-            crate::FundraiserError::TargetMet
-        );
-
-        // Transfer the funds back to the contributor
-        // CPI to the token program to transfer the funds
-        let cpi_program = self.token_program.to_account_info();
-
-        // Transfer the funds from the vault to the contributor
-        let cpi_accounts = Transfer {
-            from: self.vault.to_account_info(),
-            to: self.contributor_ata.to_account_info(),
-            authority: self.fundraiser.to_account_info(),
-        };
-
-        // Signer seeds to sign the CPI on behalf of the fundraiser account
-        let signer_seeds: [&[&[u8]]; 1] = [&[
-            b"fundraiser".as_ref(),
-            self.maker.to_account_info().key.as_ref(),
-            &[self.fundraiser.bump],
-        ]];
-
-        // CPI context with signer since the fundraiser account is a PDA
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, &signer_seeds);
-
-        // Transfer the funds from the vault to the contributor
-        transfer(cpi_ctx, self.contributor_account.amount)?;
-
-        // Update the fundraiser state by reducing the amount contributed
-        self.fundraiser.current_amount -= self.contributor_account.amount;
-
-        Ok(())
+    if !contributor.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
     }
+
+    let fund_data = fundraiser.try_borrow()?;
+    let fund = Fundraiser::from_bytes(&fund_data)?;
+
+    if fund.mint_to_raise != mint_to_raise.address().to_bytes() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let expected_fundraiser =
+        Address::find_program_address(&[SEED_FUNDRAISER, fund.maker.as_ref()], &ID).0;
+    if fundraiser.address() != &expected_fundraiser {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let current_time = Clock::get()?.unix_timestamp;
+    let elapsed_days = current_time
+        .checked_sub(fund.time_started)
+        .ok_or(ProgramError::Custom(ERR_FUNDRAISER_NOT_ENDED))?
+        .checked_div(SECONDS_TO_DAYS)
+        .ok_or(ProgramError::Custom(ERR_FUNDRAISER_NOT_ENDED))?;
+
+    if fund.duration > elapsed_days as u8 {
+        return Err(ProgramError::Custom(ERR_FUNDRAISER_NOT_ENDED));
+    }
+
+    let fund_bump = fund.bump;
+    let fund_maker = fund.maker;
+    let amount_to_raise = fund.amount_to_raise;
+    drop(fund_data);
+
+    let vault_account = unsafe { TokenAccount::from_account_view_unchecked(vault)? };
+    let vault_amount = vault_account.amount();
+
+    if vault_amount >= amount_to_raise {
+        return Err(ProgramError::Custom(ERR_TARGET_MET));
+    }
+
+    let expected_contributor_account = Contributor::derive_pda(
+        fundraiser.address(),
+        contributor.address(),
+        &ID,
+    )
+    .0;
+    if contributor_account.address() != &expected_contributor_account {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let cont_data = contributor_account.try_borrow()?;
+    if cont_data.len() < Contributor::LEN || cont_data[0] != DISCRIMINATOR_CONTRIBUTOR {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let cont = Contributor::from_bytes(&cont_data)?;
+    let refund_amount = cont.amount;
+    drop(cont_data);
+
+    if refund_amount == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let contributor_ata_expected = Address::find_program_address(
+        &[
+            contributor.address().as_ref(),
+            token_program.address().as_ref(),
+            mint_to_raise.address().as_ref(),
+        ],
+        &pinocchio_associated_token_account::ID,
+    )
+    .0;
+    if contributor_ata.address() != &contributor_ata_expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let vault_expected = Address::find_program_address(
+        &[
+            fundraiser.address().as_ref(),
+            token_program.address().as_ref(),
+            mint_to_raise.address().as_ref(),
+        ],
+        &pinocchio_associated_token_account::ID,
+    )
+    .0;
+    if vault.address() != &vault_expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let bump_byte = [fund_bump];
+    let seeds = [
+        Seed::from(SEED_FUNDRAISER),
+        Seed::from(fund_maker.as_ref()),
+        Seed::from(&bump_byte),
+    ];
+    let signers = [Signer::from(&seeds)];
+
+    Transfer::new(vault, contributor_ata, fundraiser, refund_amount)
+        .invoke_signed(&signers)?;
+
+    let mut fund_data = fundraiser.try_borrow_mut()?;
+    let fund_mut = Fundraiser::from_bytes_mut(&mut fund_data)?;
+    fund_mut.current_amount = fund_mut
+        .current_amount
+        .checked_sub(refund_amount)
+        .ok_or(ProgramError::Custom(ERR_ARITHMETIC_OVERFLOW))?;
+    drop(fund_data);
+
+    let dest_lamports = contributor.lamports();
+    contributor.set_lamports(
+        dest_lamports
+            .checked_add(contributor_account.lamports())
+            .ok_or(ProgramError::Custom(ERR_ARITHMETIC_OVERFLOW))?,
+    )?;
+
+    contributor_account.close()?;
+
+    Ok(())
 }
